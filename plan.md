@@ -2,62 +2,169 @@
 
 ## Goal
 
-1/10 scale RC car lap timer
+Lap timer for 1/10 scale RC cars, using BLE-advertising transponders detected by a
+side-mounted laptop scanner.
 
-## Requirements
+## Scope
 
-- Track width: 3 m
-- Car speed: ~30 kph
-- Reader location: side-mounted to track
-- Transponder: on/inside the car (1/10 scale RC cars)
-- Cars: up to 8, each with unique ID
-- Timing precision: within 0.1 second
-- Environment: outdoor, dry
-- Detection distance: up to 3 m lateral from side-mounted reader
+This implementation covers the **scanner / UI** side only (Python on the laptop).
+ESP32-C3 firmware is out of scope but its BLE behaviour is specified below so the
+two halves can be developed independently.
 
 ## Hardware
 
-- Car: Seeed XIAO ESP32C3 connected to ESC BEC
-- Scanner: Framework 13 7840U with Bluetooth 5.2 running NixOS
+- Car (transponder): Seeed XIAO ESP32-C3, powered from the ESC's BEC
+- Scanner: Framework 13 (Ryzen 7840U) with Bluetooth 5.2, running NixOS
 
-## Implementation
+## Race requirements
 
-- Use latest stable Python
+| Parameter            | Value                              |
+| -------------------- | ---------------------------------- |
+| Track width          | 3 m                                |
+| Car speed            | ~30 kph (≈ 8.3 m/s)                |
+| Reader location      | Side-mounted, up to 3 m lateral    |
+| Cars supported       | 8, each uniquely identified        |
+| Timing precision     | within 0.1 s                       |
+| Environment          | Outdoor, dry                       |
 
-### Bluetooth
+## BLE protocol (firmware contract)
 
-- Use `bleak` for bluetooth implementation
-- Use RSSI peak to determine timestamp per lap
-- Use 20ms as baseline bluetooth time, with prime numbers for further cars to minimise collisions
+- Each car advertises a BLE local name `LapTimer-N` where `N` is 1..8
+- Advertising intervals (one per car, primes near 20 ms baseline to minimise
+  collisions):
 
-## UI / UX
+  | Car | Interval |
+  | --- | -------- |
+  | 1   | 20 ms    |
+  | 2   | 23 ms    |
+  | 3   | 29 ms    |
+  | 4   | 31 ms    |
+  | 5   | 37 ms    |
+  | 6   | 41 ms    |
+  | 7   | 43 ms    |
+  | 8   | 47 ms    |
 
-- Use `Textual` for UI
-- Use a dark theme for UI
-- Use a mono font that has retro look
-- Has a Start & Stop action
-- Once press Start, it will show a 3 second countdown, before showing Go and recording lap times
-- It won't record a lap time for a period after race starts to prevent accidental laps
-- Active cars have a white, while inactive cars are grey
-- Car's default names are One, Two, Three, Four, etc.
-- Cars are listed in table, with a row per lap time detected
-- Below their times, show the top 5 times for the day for that car
-- Lap times should be shown in ss:mm format
-- Total race time should be shown in mm:ss:mm format
-- Defaults are:
-    - Car One only enabled by default on startup
-    - 3 laps
-    - 3 seconds before starting to detect laps from race start
-- Leverage keyboard shortcuts to make navigating UI easier
-    - 1-8 to select a car
-        - D to disable the car from being monitored
-        - R to rename the car from default name
-    - C to enter configuration
-        - L with a number to set laps before race finishes
-        - L with a D to disable lap counting
-        - M for minimum signal strength to start determining if lap was completed
-    - H to enter history
-        - C followed by a car number to clear that cars lap times
-        - A to clear all cars lap times
-    - E to export the cars recorded data to a CSV file
+- Scanner uses `bleak` with a detection callback; identifies each car by local name
+  and records `(rssi, monotonic_timestamp)` per advertisement.
 
+## Detection algorithm
+
+Per-car threshold-plus-lockout peak detector:
+
+1. Samples below the configured RSSI threshold are ignored.
+2. When a sample first crosses the threshold a "pass window" opens.
+3. While in the window, track the max RSSI sample and its timestamp.
+4. When samples have been below the threshold for a short drop period (~300 ms)
+   the window closes and the peak's timestamp is the lap-completion time.
+5. After emitting a lap, the per-car detector is locked out for `lockout_seconds`
+   (same value used as the race-start lockout — see below).
+
+## Race flow
+
+1. **Idle** — Car 1 enabled by default.
+2. **Start pressed** — 3-second visible countdown (3, 2, 1, GO).
+3. **Running** — "GO" the race timer starts; lap detection is suppressed for
+   the configured `lockout_seconds` (default 3 s) to prevent recording the start
+   line as a lap.
+4. **Lap detected** — Append to the car's lap list, recompute its top-5-today.
+5. **Finished** — when every enabled car has reached the configured lap count
+   (or never, if lap counting is disabled). Also stoppable manually.
+
+## UI / UX (Textual)
+
+- Dark theme; retro mono font (`Courier New`-style, configured via Textual CSS).
+- Layout: header (race state + clock), grid of 8 car cards (4 × 2), footer
+  (key hints).
+- Active cars rendered white, disabled cars grey.
+- Each car card shows:
+  - Car number + display name
+  - Current race laps (one per row), with elapsed time per lap
+- Default car display names: `One`, `Two`, …, `Eight`.
+- Selected car visually highlighted.
+
+### Time format
+
+- Lap time: `ss.ms` — seconds with millisecond precision (`12.345`).
+- Race time: `mm:ss.ms` — minutes:seconds.milliseconds (`03:42.187`).
+
+### Keyboard shortcuts
+
+Top-level:
+
+| Key       | Action                                                   |
+| --------- | -------------------------------------------------------- |
+| `S`       | Start / Stop the race                                    |
+| `1-8`     | Select car N                                             |
+| `← / →`   | Move selection to previous / next car (wraps 1↔8)        |
+| `D`       | Toggle the selected car's enabled state                  |
+| `R`       | Rename the selected car (modal text input)               |
+| `C`       | Open Configuration screen                                |
+| `H`       | Open History screen                                      |
+| `E`       | Export current session to CSV                            |
+| `Q`       | Quit                                                     |
+
+Configuration screen:
+
+| Key         | Action                                                    |
+| ----------- | --------------------------------------------------------- |
+| `Tab` / `↑↓`| Move focus between fields                                 |
+| `Enter`     | Apply current values and close                            |
+| `Esc`       | Close without applying                                    |
+
+Fields:
+
+| Field          | Accepted input                                            |
+| -------------- | --------------------------------------------------------- |
+| Laps target    | Number 1–99, or `D` to disable (race runs until Stop)     |
+| Min RSSI (dBm) | Integer like `-70` (more negative = needs closer pass)    |
+| Lockout (s)    | Number of seconds — race-start gate + per-car cooldown    |
+
+History screen shows:
+
+- **Top 10 fastest laps overall** — best 10 lap times across all cars (all-time),
+  each row tagged with the car that set it.
+- **Per-car top 5 today** — the best 5 laps each car has recorded today.
+
+| Key       | Action                                            |
+| --------- | ------------------------------------------------- |
+| `C<n>`    | Clear lap history for car N                       |
+| `A`       | Clear all cars' lap history                       |
+| `Esc`     | Close                                             |
+
+## Persistence
+
+- SQLite at `~/.laptimerble/laps.db`.
+- Tables: `cars` (id, display_name, enabled), `laps` (id, car_id, race_id,
+  lap_index, lap_seconds, recorded_at), `races` (id, started_at, finished_at,
+  laps_target).
+- "Top 5 today" = the 5 smallest `lap_seconds` for the car where
+  `date(recorded_at) = today`.
+
+## Export
+
+`E` writes two files into `./exports/`:
+
+- `laps_<YYYY-MM-DD_HHMMSS>.csv` — the **current race only** (omitted if no laps
+  recorded yet). Columns: `race_started_at, car_id, car_name, lap_index,
+  lap_seconds`.
+- `laps_alltime_<YYYY-MM-DD_HHMMSS>.csv` — **every lap ever recorded** across
+  all races. Columns: `race_started_at, car_id, car_name, lap_index,
+  lap_seconds, recorded_at`.
+
+## Defaults
+
+| Setting               | Default                |
+| --------------------- | ---------------------- |
+| Enabled cars          | Car 1 only             |
+| Laps target           | 3                      |
+| Lockout (s)           | 3                      |
+| RSSI threshold (dBm)  | -70                    |
+| Drop-window (s)       | 0.3 (internal)         |
+
+## Tests
+
+- `pytest` covering pure-logic modules:
+  - `timeutil` — format/parse round-trips
+  - `scanner` — peak detector against synthesised RSSI traces
+  - `storage` — schema bootstrap, top-5 query, history clearing
+- BLE and Textual layers exercised manually.

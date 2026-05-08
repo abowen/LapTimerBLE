@@ -36,6 +36,18 @@ def test_set_car_enabled_persists(storage: Storage) -> None:
     assert cars[3] is True
 
 
+def test_top_today_includes_recorded_at(storage: Storage) -> None:
+    started = datetime(2026, 5, 8, 14, 30, 0)
+    race_id = storage.start_race(started, 3)
+    storage.record_lap(race_id, 0, 1, 5.123, started)
+
+    top = storage.top_today(0, today=started.date())
+    assert len(top) == 1
+    lap_seconds, recorded_at = top[0]
+    assert lap_seconds == 5.123
+    assert recorded_at.startswith("2026-05-08T14:30:00")
+
+
 def test_record_lap_and_top_today(storage: Storage) -> None:
     started = datetime.now()
     race_id = storage.start_race(started, 3)
@@ -50,7 +62,7 @@ def test_record_lap_and_top_today(storage: Storage) -> None:
         )
 
     top = storage.top_today(0, today=started.date())
-    assert top == sorted(times)[:5]
+    assert [s for s, _ in top] == sorted(times)[:5]
 
 
 def test_top_today_filters_by_date(storage: Storage) -> None:
@@ -61,7 +73,7 @@ def test_top_today_filters_by_date(storage: Storage) -> None:
     storage.record_lap(race_id, 0, 2, 8.0, datetime(2025, 1, 2, 12, 0, 0))
 
     top = storage.top_today(0, today=started.date())
-    assert top == [10.0]
+    assert [s for s, _ in top] == [10.0]
 
 
 def test_clear_car_only_clears_one(storage: Storage) -> None:
@@ -72,7 +84,7 @@ def test_clear_car_only_clears_one(storage: Storage) -> None:
 
     storage.clear_car(0)
     assert storage.top_today(0) == []
-    assert storage.top_today(1) == [11.0]
+    assert [s for s, _ in storage.top_today(1)] == [11.0]
 
 
 def test_top_overall_returns_fastest_across_cars(storage: Storage) -> None:

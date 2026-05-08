@@ -122,8 +122,10 @@ Fields:
 History screen shows:
 
 - **Top 10 fastest laps overall** — best 10 lap times across all cars (all-time),
-  each row tagged with the car that set it.
-- **Per-car top 5 today** — the best 5 laps each car has recorded today.
+  each row tagged with the car that set it and the date it was set.
+- **Per-car top 5 today** — the best 5 laps each car has recorded today, displayed
+  as a bordered card. The card title shows the car name and the date of the fastest
+  lap. Each lap row shows the lap time and the time of day (`HH:MM`) it was recorded.
 
 | Key       | Action                                            |
 | --------- | ------------------------------------------------- |

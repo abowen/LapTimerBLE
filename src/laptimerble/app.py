@@ -91,6 +91,14 @@ Screen {
     border: heavy green;
 }
 
+.hist-car-card {
+    border: round white;
+    padding: 0 1;
+    color: white;
+    background: $surface;
+    margin: 0 0 1 0;
+}
+
 .car-name {
     text-style: bold;
 }
@@ -197,6 +205,27 @@ class CarCard(Static):
 
 
 # ----- modal screens -----------------------------------------------------------
+
+
+class CarHistoryCard(Static):
+    """Bordered card showing a car's top-5-today laps with timestamps."""
+
+    def __init__(self, car: CarConfig, laps: list[tuple[float, str]]) -> None:
+        super().__init__(self._build(car, laps), id=f"hist-car-{car.index}")
+        self.car = car
+        self.add_class("hist-car-card")
+
+    @staticmethod
+    def _build(car: CarConfig, laps: list[tuple[float, str]]) -> str:
+        if not laps:
+            return f"[bold]{car.number}. {car.display_name}[/bold]\n  [grey]no times today[/grey]"
+        date_str = laps[0][1][:10]  # YYYY-MM-DD from ISO string
+        title = f"[bold]{car.number}. {car.display_name}[/bold]  [grey]{date_str}[/grey]"
+        lines = [f"  {format_lap(s)}   {ts[11:16]}" for s, ts in laps]
+        return f"{title}\n" + "\n".join(lines)
+
+    def update_laps(self, laps: list[tuple[float, str]]) -> None:
+        self.update(self._build(self.car, laps))
 
 
 class RenameScreen(ModalScreen[Optional[str]]):
@@ -343,7 +372,7 @@ class HistoryScreen(ModalScreen[Optional[str]]):
                 yield Static(self._render_overall(), id="hist-overall")
                 yield Static("[cyan]Top 5 today per car[/cyan]", classes="hist-section")
                 for car in self.cars:
-                    yield Static(self._render_car(car), id=f"hist-{car.index}")
+                    yield CarHistoryCard(car, self.storage.top_today(car.index))
             yield Static(
                 "Press C then a digit 1-8 to clear that car, A to clear all, Esc to close.",
                 classes="hint",
@@ -363,14 +392,6 @@ class HistoryScreen(ModalScreen[Optional[str]]):
                 f"[bold]{car_index + 1}.{car_name}[/bold]  [grey]{day}[/grey]"
             )
         return "\n".join(lines)
-
-    def _render_car(self, car: CarConfig) -> str:
-        top = self.storage.top_today(car.index)
-        if not top:
-            tail = "  [grey]no times today[/grey]"
-        else:
-            tail = "  " + "  ".join(format_lap(s) for s in top)
-        return f"  [bold]{car.number}. {car.display_name}[/bold]{tail}"
 
     def on_key(self, event: events.Key) -> None:
         if self._pending_clear:
@@ -401,7 +422,8 @@ class HistoryScreen(ModalScreen[Optional[str]]):
     def _refresh_rows(self) -> None:
         self.query_one("#hist-overall", Static).update(self._render_overall())
         for car in self.cars:
-            self.query_one(f"#hist-{car.index}", Static).update(self._render_car(car))
+            laps = self.storage.top_today(car.index)
+            self.query_one(f"#hist-car-{car.index}", CarHistoryCard).update_laps(laps)
 
 
 # ----- main app ---------------------------------------------------------------

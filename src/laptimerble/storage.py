@@ -130,18 +130,18 @@ class Storage:
                 (race_id, car_index, lap_index, lap_seconds, recorded_at.isoformat()),
             )
 
-    def top_today(self, car_index: int, today: date | None = None, limit: int = 5) -> list[float]:
+    def top_today(self, car_index: int, today: date | None = None, limit: int = 5) -> list[tuple[float, str]]:
         target = (today or date.today()).isoformat()
         rows = self._conn.execute(
             """
-            SELECT lap_seconds FROM laps
+            SELECT lap_seconds, recorded_at FROM laps
              WHERE car_index = ? AND substr(recorded_at, 1, 10) = ?
              ORDER BY lap_seconds ASC
              LIMIT ?
             """,
             (car_index, target, limit),
         ).fetchall()
-        return [row["lap_seconds"] for row in rows]
+        return [(row["lap_seconds"], row["recorded_at"]) for row in rows]
 
     def top_overall(self, limit: int = 10) -> list[tuple[int, float, str]]:
         """Top ``limit`` fastest laps across all cars, all-time.

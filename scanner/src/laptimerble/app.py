@@ -573,15 +573,17 @@ class LapTimerApp(App):
             self.scanner = BleScanner(self.registry, on_pass=self._on_ble_pass)
             self.scanner.set_enabled({c.index for c in self.cars if c.enabled})
             await self.scanner.start()
-            # Surface the scan path: "passive" goes through BlueZ's
-            # AdvertisementMonitor (one callback per advertisement) and is
-            # required for the 20–47 ms transponder cadence; "active" falls
-            # through D-Bus PropertiesChanged coalescing and updates only
-            # every few seconds — visible here so silent fallback is obvious.
             self.scanner_status = f"scanning ({self.scanner.mode or 'unknown'})"
         except Exception as exc:  # noqa: BLE001
             log.exception("BLE scanner failed to start")
-            self.scanner_status = f"off ({type(exc).__name__})"
+            # Include str(exc) in the header so the user gets the actionable
+            # message (e.g. "HCI scan start timed out — is bluetoothd...?")
+            # without having to tail ~/.laptimerble/scanner.log. Trim long
+            # tracebacks so the header doesn't wrap.
+            msg = str(exc) or type(exc).__name__
+            if len(msg) > 80:
+                msg = msg[:77] + "..."
+            self.scanner_status = f"off — {msg}"
             self.scanner = None
         self._drain_passes_task = asyncio.create_task(self._drain_passes())
 
@@ -593,7 +595,7 @@ class LapTimerApp(App):
     # ----- BLE → UI bridge -----
 
     def _on_ble_pass(self, car_index: int, peak_t: float) -> None:
-        # Called from event loop thread by bleak; safe to enqueue.
+        # Called from the asyncio loop by the HCI Protocol; safe to enqueue.
         try:
             self._pass_queue.put_nowait((car_index, peak_t))
         except Exception:  # noqa: BLE001
@@ -665,20 +667,14 @@ class LapTimerApp(App):
         header.update(f"{line1}\n[bold]{elapsed}[/bold]\n{config_line}")
 
     def _ble_status_markup(self) -> str:
-        # passive = AdvertisementMonitor path (one callback per ad → ideal)
-        # active  = D-Bus discovery + DuplicateData=True (the only working
-        #           path on the MT7921 — not an error, just a fact)
-        # off     = scanner failed to start (the only real error)
+        # Red only when the scanner failed to start outright (the message
+        # already explains why). Otherwise grey, alongside the rest of the
+        # config line, with the live rolling Hz appended.
         scanner = self.scanner
         if scanner is None:
             return f"[red]{self.scanner_status}[/red]"
         rate = scanner.callback_rate_hz()
         rate_text = f" {rate:.1f} Hz" if rate is not None else ""
-        if scanner.mode == "passive":
-            return f"[green]{self.scanner_status}{rate_text}[/green]"
-        # mode == "active" or unknown: render in normal grey alongside the
-        # other config fields. Don't flag it as an error — the host config
-        # check ran at startup and concluded active is the correct path.
         return f"[grey]{self.scanner_status}{rate_text}[/grey]"
 
     def _race_elapsed(self) -> float:

@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "Andrew Bowen" }]
 dependencies = [
-    "bleak>=0.22",
+    "aioblescan>=0.2.14",
     "textual>=0.83",
 ]
 

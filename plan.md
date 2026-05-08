@@ -20,73 +20,59 @@ against the BLE protocol below as the contract:
 
 ## Scanner host requirements
 
-The 20–47 ms advertising cadence is only deliverable end-to-end when BlueZ
-exposes `org.bluez.AdvertisementMonitorManager1`. Bleak's passive scan
-registers an OR-pattern monitor on that interface and receives one callback
-per matching advertisement. Without it, the scanner falls back to active
-discovery; BlueZ then routes ads through its D-Bus discovery cache and
-`PropertiesChanged` is coalesced to multi-second updates, defeating peak
-detection.
+The scanner uses `aioblescan` to talk to the BT controller through a raw
+HCI socket. This bypasses `bluetoothd` and BlueZ's D-Bus discovery cache
+entirely — every LE Advertising Report event from the controller becomes
+one callback into the peak detector with no coalescing in between.
 
-`AdvertisementMonitorManager1` is registered only when bluetoothd runs with
-**Experimental features enabled**. On NixOS:
+Two host requirements before launching the app:
 
-```nix
-hardware.bluetooth.settings.General.Experimental = true;
-```
+1. **`bluetoothd` must be off** on the same `hci0`. Its scan commands
+   conflict with ours. On NixOS:
 
-After `nixos-rebuild switch` and `systemctl restart bluetooth`, verify:
-
-```sh
-busctl call org.bluez /org/bluez/hci0 \
-  org.bluez.AdvertisementMonitorManager1 SupportedMonitorTypes
-```
-
-should return a non-empty array (e.g. `as 1 "or_patterns"`). The header in
-the running app shows `BLE: scanning (passive)` in green when this works,
-and `BLE: scanning (active) — passive unavailable` in red when it doesn't.
-
-**Controller offload requirement.** Even with `Experimental = true`, the
-passive path only delivers events if the BT controller offloads pattern
-matching to hardware. Check:
-
-```sh
-busctl get-property org.bluez /org/bluez/hci0 \
-  org.bluez.AdvertisementMonitorManager1 SupportedFeatures
-```
-
-A non-empty list (e.g. `controller-patterns`) means offload works — passive
-will deliver every matching ad. An empty list (`as 0`) means BlueZ accepts
-the monitor registration but never runs a scan to source matches from, so
-0 callbacks are delivered. The MediaTek MT7921 in the Framework 13 AMD
-returns empty here; the scanner detects this case at startup and forces the
-active+`DuplicateData=True` path.
-
-**Active-mode throughput on MT7921.** With Wi-Fi enabled and the transponder
-~3 m away, the AMD/MT7921 combo card produces about 5–8 callbacks/sec for
-a 50 Hz advertiser — far below the firmware's ad rate but still enough to
-catch every pass for the side-mounted 30 kph scenario. The rate is gated by
-two things:
-
-1. **BT/Wi-Fi antenna sharing.** The MT7921 multiplexes one antenna between
-   BT and Wi-Fi — heavy Wi-Fi traffic halves (or worse) BT scan duty. If
-   throughput collapses to "every few seconds", check whether Wi-Fi is busy.
-   Quickest test: `nmcli radio wifi off`, then watch the rate climb in the
-   header.
-2. **Kernel LE scan parameters.** `/sys/kernel/debug/bluetooth/hci0/le_scan_int`
-   and `le_scan_window` (units of 0.625 ms) control the scan duty cycle.
-   Default is around 60/30 ms (50 % duty); setting both to `16` (10 ms / 10 ms,
-   100 % duty on its time slot) is the upper bound for this controller. It
-   needs root and survives until reboot:
-   ```sh
-   echo 16 | sudo tee /sys/kernel/debug/bluetooth/hci0/le_scan_int
-   echo 16 | sudo tee /sys/kernel/debug/bluetooth/hci0/le_scan_window
+   ```nix
+   hardware.bluetooth.enable = false;
    ```
-   Make permanent via a NixOS systemd one-shot service if it helps.
 
-The header shows the live rolling rate (e.g. `BLE: scanning (active) — passive
-unavailable 7.3 Hz`) so the operator can confirm the controller is keeping
-up before each session.
+   `nixos-rebuild switch` and confirm `systemctl status bluetooth` is
+   `inactive (dead)`. (Existing audio/keyboard pairings via BlueZ will
+   stop working while the scanner is in use — this host is dedicated to
+   timing.)
+
+2. **Capabilities on the Python interpreter.** Opening
+   `AF_BLUETOOTH SOCK_RAW`, binding to `hci0`, and issuing the `HCIDEVUP`
+   ioctl need `CAP_NET_RAW` and `CAP_NET_ADMIN`. On a non-Nix distro this
+   would be `setcap cap_net_raw,cap_net_admin+eip "$(realpath .venv/bin/python)"`,
+   but `/nix/store` is read-only so xattrs there silently fail to persist —
+   `getcap` returns empty. Work around by copying the binary into the venv
+   (writable filesystem) and setting caps on the copy:
+
+   ```sh
+   cp "$(realpath .venv/bin/python)" .venv/bin/python.real
+   sudo setcap cap_net_raw,cap_net_admin+eip .venv/bin/python.real
+   getcap .venv/bin/python.real    # confirm: ... = cap_net_admin,cap_net_raw+eip
+   ```
+
+   Then launch the app via the cap'd copy directly. `pyvenv.cfg` lives one
+   level up from the binary, so the venv's `site-packages` are still picked
+   up automatically:
+
+   ```sh
+   .venv/bin/python.real -m laptimerble
+   ```
+
+   (The `.venv/bin/laptimerble` shebang script can't be used as-is because
+   it points to the original `/nix/store` python that lacks caps.) Permanent
+   setup would use NixOS `security.wrappers` or a systemd unit with
+   `AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN`.
+
+The header shows the live rolling rate (e.g. `BLE: scanning (active) 28 Hz`)
+so the operator can confirm the controller is keeping up before each session.
+On the Framework 13 / MT7921, with Wi-Fi enabled and a transponder ~3 m
+away, expect roughly 20–40 Hz per car at the controller's 10 ms / 10 ms
+default scan window — Wi-Fi activity on the shared antenna can briefly
+halve that. `nmcli radio wifi off` is the quickest way to confirm Wi-Fi
+coex is or isn't the limiter.
 
 ## Race requirements
 
@@ -120,7 +106,8 @@ up before each session.
   | 7   | 43 ms    |
   | 8   | 47 ms    |
 
-- Scanner uses `bleak` with a detection callback; identifies each car by local name
+- Scanner uses `aioblescan` to read every LE Advertising Report event off
+  a raw HCI socket (no `bluetoothd`), identifies each car by local name,
   and records `(rssi, monotonic_timestamp)` per advertisement.
 
 ## Detection algorithm
@@ -195,7 +182,7 @@ Fields:
 | Field          | Accepted input                                            |
 | -------------- | --------------------------------------------------------- |
 | Laps target    | Number 1–99, or `D` to disable (race runs until Stop)     |
-| Min RSSI (dBm) | Integer like `-70` (more negative = needs closer pass)    |
+| Min RSSI (dBm) | Integer like `-100` (more negative = needs closer pass)   |
 | Lockout (s)    | Number of seconds — race-start gate + per-car cooldown    |
 
 Debug screen shows:

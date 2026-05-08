@@ -1,19 +1,63 @@
 """BLE scanner + per-car RSSI peak detector.
 
-The detector logic is independent of bleak and unit-tested via ``feed()``;
-``BleScanner`` is a thin async wrapper that pumps advertisement callbacks into
-the right per-car detector.
+The scanner uses ``aioblescan`` to talk directly to the controller via a raw
+HCI socket, bypassing ``bluetoothd`` entirely. This avoids BlueZ's D-Bus
+discovery cache (which coalesces ads to multi-second updates on controllers
+without ``AdvertisementMonitor`` offload) and gives us one callback per
+LE Advertising Report event.
+
+Runtime requirements:
+
+* ``bluetoothd`` must NOT be active on the same hci device — its scan
+  commands fight ours. Stop with ``systemctl stop bluetooth`` (NixOS:
+  also flip ``hardware.bluetooth.enable`` off and rebuild).
+* The Python interpreter needs ``CAP_NET_RAW`` and ``CAP_NET_ADMIN`` to
+  open ``AF_BLUETOOTH`` SOCK_RAW and bind to ``hci0``:
+  ``sudo setcap cap_net_raw,cap_net_admin+eip $(realpath .venv/bin/python)``
+
+The detector logic is backend-agnostic and unit-tested via ``feed()``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import errno
+import fcntl
 import logging
+import socket
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Deque, Optional
 
 from .config import NUM_CARS, ble_local_name
+
+# ioctl(hci_socket, HCIDEVUP, dev_id) brings an hci device up. Encoded as
+# _IOW('H', 201, int): 0x40000000 (write) | (4 << 16) | ('H' << 8) | 201.
+# Without bluetoothd around, no one auto-ups the device after boot, so the
+# kernel ignores HCI commands sent on it (no command-complete events) and
+# aioblescan hangs forever waiting for ``_initialized``.
+HCIDEVUP = 0x400448C9
+
+
+def _ensure_hci_up(hci_index: int) -> None:
+    """Bring hci<index> up if it isn't already.
+
+    Needs ``CAP_NET_ADMIN`` (granted by the same setcap that lets us bind
+    AF_BLUETOOTH SOCK_RAW). EALREADY means it was already up, which is the
+    common path when running consecutively.
+    """
+    sock = socket.socket(
+        family=socket.AF_BLUETOOTH,
+        type=socket.SOCK_RAW,
+        proto=socket.BTPROTO_HCI,
+    )
+    try:
+        fcntl.ioctl(sock.fileno(), HCIDEVUP, hci_index)
+    except OSError as exc:
+        if exc.errno != errno.EALREADY:
+            raise
+    finally:
+        sock.close()
 
 # Number of most-recent (rssi, monotonic_t) samples kept per car for the Debug
 # screen. Sized to comfortably exceed one screen of rows.
@@ -23,46 +67,6 @@ log = logging.getLogger(__name__)
 
 # Timestamp of a detected pass, in monotonic seconds (matches ``time.monotonic``).
 PassCallback = Callable[[int, float], None]  # (car_index, peak_t)
-
-
-def _advertisement_monitor_offload_supported(adapter: str = "hci0") -> bool:
-    """Does ``org.bluez.AdvertisementMonitorManager1.SupportedFeatures`` list anything?
-
-    Empty list → the BT controller cannot offload OR-pattern matching to
-    hardware. Without offload, BlueZ accepts an OrPattern monitor but never
-    runs a scan to source matches from, so the monitor produces 0 callbacks.
-    Use ``busctl`` rather than dragging in dbus-fast/dbus-next at module load
-    — this is a one-shot startup probe.
-    """
-    import subprocess
-
-    try:
-        result = subprocess.run(
-            [
-                "busctl",
-                "--system",
-                "get-property",
-                "org.bluez",
-                f"/org/bluez/{adapter}",
-                "org.bluez.AdvertisementMonitorManager1",
-                "SupportedFeatures",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-    except Exception:  # noqa: BLE001
-        return False
-    if result.returncode != 0:
-        return False
-    # Output looks like  as 2 "controller-patterns" "..."  or  as 0
-    parts = result.stdout.strip().split(maxsplit=2)
-    if len(parts) < 2 or parts[0] != "as":
-        return False
-    try:
-        return int(parts[1]) > 0
-    except ValueError:
-        return False
 
 
 @dataclass
@@ -191,11 +195,14 @@ class CarDetectorRegistry:
 
 
 class BleScanner:
-    """Async wrapper around ``bleak`` that fans advertisements out to detectors.
+    """Raw-HCI BLE scanner that fans LapTimer-* ads to per-car detectors.
 
-    Importing ``bleak`` is deferred so the rest of the app stays usable (and
-    testable) on a machine without Bluetooth.
+    Uses ``aioblescan`` directly (no ``bluetoothd``) so every LE Advertising
+    Report event from the controller reaches a detector with no D-Bus
+    coalescing in between.
     """
+
+    HCI_INTERFACE = 0  # hci0
 
     def __init__(
         self,
@@ -204,23 +211,23 @@ class BleScanner:
     ) -> None:
         self.registry = registry
         self.on_pass = on_pass
-        self._scanner = None
         self._enabled_cars: set[int] = set()
         self._name_to_index: dict[str, int] = {
             ble_local_name(i): i for i in range(NUM_CARS)
         }
-        # Set after start() to "passive" or "active" so the UI can surface
-        # which path actually came up — silent fallback to active masks the
-        # main perf regression (BlueZ D-Bus discovery cache coalescing ads
-        # to multi-second updates), so make it visible.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._transport = None
+        self._btctrl = None
+        # ``mode`` is "active" while the HCI scan is live, None otherwise.
+        # Raw HCI scanning is always controller-active (with SCAN_RSP); the
+        # field is kept as a string so the header can render "scanning
+        # (active)" alongside the live Hz rate.
         self.mode: Optional[str] = None
-        # Reason passive scan was rejected, if it was. Useful for the UI.
-        self.passive_failure_reason: Optional[str] = None
         # Rolling per-second callback rate across all LapTimer-* cars so the
         # header can show actual throughput. The MT7921's BT/Wi-Fi shared
         # antenna throttles BT during Wi-Fi activity, so this number is what
         # actually matters for whether peak detection has the resolution to
-        # find a 30 kph pass — not the firmware's 50 Hz advertising rate.
+        # find a 30 kph pass.
         self._callback_times: Deque[float] = deque(maxlen=512)
 
     def set_enabled(self, indices: set[int]) -> None:
@@ -238,8 +245,6 @@ class BleScanner:
         except RuntimeError:
             return None
         cutoff = now - window_seconds
-        # deque slicing is O(n); n is bounded by maxlen and we're called at
-        # the header-refresh cadence, so this is fine.
         in_window = [t for t in self._callback_times if t >= cutoff]
         if len(in_window) < 2:
             return None
@@ -249,113 +254,104 @@ class BleScanner:
         return (len(in_window) - 1) / span
 
     async def start(self) -> None:
-        from bleak import BleakScanner  # noqa: WPS433
+        # Deferred import: aioblescan opens an AF_BLUETOOTH SOCK_RAW socket
+        # at module-load time only when create_bt_socket() is called, so
+        # plain ``import aioblescan`` is harmless on a machine without BT.
+        import aioblescan as aiobs  # noqa: WPS433
 
-        loop = asyncio.get_running_loop()
+        # Without bluetoothd, hci0 stays DOWN after boot and HCI commands
+        # silently never get responses — we'd hang in send_scan_request.
+        _ensure_hci_up(self.HCI_INTERFACE)
 
-        def _detection_callback(device, advertisement_data) -> None:  # type: ignore[no-untyped-def]
-            name = advertisement_data.local_name or device.name
-            if not name:
-                return
-            idx = self._name_to_index.get(name)
-            if idx is None:
-                return
-            rssi = advertisement_data.rssi
-            if rssi is None:
-                return
-            t = loop.time()
-            self._callback_times.append(t)
-            if idx not in self._enabled_cars:
-                # Still record samples so the Debug screen / RSSI display work
-                # even before the car has been enabled for racing.
-                self.registry.record_sample(idx, int(rssi), t)
-                return
-            peak_t = self.registry.feed(idx, int(rssi), t)
-            if peak_t is not None:
-                self.on_pass(idx, peak_t)
-
-        # BlueZ's classic *active* discovery path coalesces advertisements
-        # through D-Bus PropertiesChanged signals and a discovery cache, so
-        # even with DuplicateData=True the detection callback fires only every
-        # few seconds. Passive scanning with kernel-level AdvertisementMonitor
-        # patterns (BlueZ 5.56+, kernel >= 5.10) delivers every matching ad
-        # straight from the controller — perfect for the 20 ms transponder.
-        #
-        # Fallback: if the adapter / kernel doesn't support monitors, drop to
-        # active mode with DuplicateData=True (better than nothing).
-        self._scanner = await self._start_passive(_detection_callback)
-        if self._scanner is None:
-            self._scanner = await self._start_active(_detection_callback)
-            self.mode = "active"
-        else:
-            self.mode = "passive"
-
-    async def _start_passive(self, detection_callback) -> object | None:  # type: ignore[no-untyped-def]
-        from bleak import BleakScanner  # noqa: WPS433
-
-        try:
-            from bleak.args.bluez import OrPattern  # noqa: WPS433
-            from bleak.assigned_numbers import AdvertisementDataType  # noqa: WPS433
-        except Exception as exc:  # noqa: BLE001
-            log.warning("bleak BlueZ args unavailable (%s); using active scan", exc)
-            self.passive_failure_reason = f"bleak args unavailable: {exc}"
-            return None
-
-        # BlueZ will happily register an OrPattern monitor even when the
-        # controller has no MSFT offload — but in that case no LE scan is
-        # auto-started and the monitor never fires (observed on MediaTek
-        # MT7921: SupportedFeatures = []). Guard against this silent failure
-        # so we fall back to active+DuplicateData rather than reporting
-        # passive-mode while delivering 0 callbacks.
-        if not _advertisement_monitor_offload_supported():
-            self.passive_failure_reason = (
-                "controller does not offload AdvertisementMonitor patterns"
-            )
-            log.warning(
-                "Passive scan skipped: %s",
-                self.passive_failure_reason,
-            )
-            return None
-
-        # Match any local name starting with "LapTimer-" — covers all 8 cars.
-        or_patterns = [
-            OrPattern(0, AdvertisementDataType.COMPLETE_LOCAL_NAME, b"LapTimer-"),
-            OrPattern(0, AdvertisementDataType.SHORTENED_LOCAL_NAME, b"LapTimer-"),
-        ]
-        scanner = BleakScanner(
-            detection_callback=detection_callback,
-            scanning_mode="passive",
-            bluez={"or_patterns": or_patterns},
+        self._loop = asyncio.get_running_loop()
+        sock = aiobs.create_bt_socket(self.HCI_INTERFACE)
+        # _create_connection_transport is a private asyncio API but it's the
+        # canonical way to bind a Protocol to a pre-existing socket — see
+        # the aioblescan README. There is no public equivalent that accepts
+        # a non-stream/non-datagram socket.
+        conn, btctrl = await self._loop._create_connection_transport(
+            sock, aiobs.BLEScanRequester, None, None
         )
+        btctrl.process = self._on_packet
+        self._transport = conn
+        self._btctrl = btctrl
+        # isactivescan=True → controller asks for SCAN_RSP, so the local
+        # name (which the firmware advertises in the ADV payload) shows up
+        # reliably. Default scan params are 10 ms / 10 ms ≈ 100 % duty
+        # cycle on this controller's BT time slice.
+        # Wrap in a timeout: send_scan_request awaits an internal Event that
+        # only sets after HCI command-complete responses come back. If
+        # bluetoothd is still up, or the interpreter lacks CAP_NET_ADMIN,
+        # those responses never arrive — fail loudly instead of hanging the
+        # app's on_mount forever.
         try:
-            await scanner.start()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Passive scan unsupported (%s); falling back to active", exc)
-            self.passive_failure_reason = str(exc) or type(exc).__name__
+            await asyncio.wait_for(
+                btctrl.send_scan_request(isactivescan=True), timeout=5.0
+            )
+        except asyncio.TimeoutError as exc:
             try:
-                await scanner.stop()
+                self._transport.close()
             except Exception:  # noqa: BLE001
                 pass
-            return None
-        log.info("BLE scanner started (passive + advertisement monitor)")
-        return scanner
-
-    async def _start_active(self, detection_callback) -> object:  # type: ignore[no-untyped-def]
-        from bleak import BleakScanner  # noqa: WPS433
-
-        scanner = BleakScanner(
-            detection_callback=detection_callback,
-            bluez={"filters": {"DuplicateData": True}},
-        )
-        await scanner.start()
-        log.info("BLE scanner started (active + DuplicateData=True)")
-        return scanner
+            self._btctrl = None
+            self._transport = None
+            raise RuntimeError(
+                "HCI scan start timed out — is bluetoothd still running, "
+                "or does python lack CAP_NET_ADMIN?"
+            ) from exc
+        self.mode = "active"
+        log.info("Raw HCI scanner started on hci%d", self.HCI_INTERFACE)
 
     async def stop(self) -> None:
-        if self._scanner is not None:
+        if self._btctrl is not None:
             try:
-                await self._scanner.stop()
+                await self._btctrl.stop_scan_request()
             except Exception:  # noqa: BLE001
-                log.exception("Error stopping BLE scanner")
-            self._scanner = None
+                log.exception("stop_scan_request failed")
+        if self._transport is not None:
+            try:
+                self._transport.close()
+            except Exception:  # noqa: BLE001
+                log.exception("transport close failed")
+        self._btctrl = None
+        self._transport = None
         self.mode = None
+
+    def _on_packet(self, data: bytes) -> None:
+        # Called from the BLEScanRequester protocol on the asyncio loop —
+        # synchronous and serialised with the rest of the app.
+        import aioblescan as aiobs  # noqa: WPS433
+
+        ev = aiobs.HCI_Event()
+        try:
+            ev.decode(data)
+        except Exception:  # noqa: BLE001
+            return
+
+        # Only LE Advertising Reports carry a name + RSSI for our cars.
+        name_field = ev.retrieve("Complete Name") or ev.retrieve("Short Name")
+        if not name_field:
+            return
+        rssi_field = ev.retrieve("rssi")
+        if not rssi_field:
+            return
+
+        name = name_field[0].val
+        if isinstance(name, bytes):
+            name = name.decode("utf-8", errors="replace")
+        idx = self._name_to_index.get(name)
+        if idx is None:
+            return
+
+        rssi = int(rssi_field[-1].val)
+        # An HCI event can bundle several reports; pick the freshest "now"
+        # for all of them rather than trying to back-date.
+        assert self._loop is not None
+        t = self._loop.time()
+        self._callback_times.append(t)
+        if idx not in self._enabled_cars:
+            self.registry.record_sample(idx, rssi, t)
+            return
+        peak_t = self.registry.feed(idx, rssi, t)
+        if peak_t is not None:
+            self.on_pass(idx, peak_t)

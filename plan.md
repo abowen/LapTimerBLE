@@ -104,11 +104,12 @@ Top-level:
 | `S`       | Start / Stop the race                                    |
 | `1-8`     | Select car N                                             |
 | `← / →`   | Move selection to previous / next car (wraps 1↔8)        |
-| `D`       | Toggle the selected car's enabled state                  |
+| `E`       | Toggle the selected car's enabled state                  |
+| `D`       | Open Debug screen for the selected car                   |
 | `R`       | Rename the selected car (modal text input)               |
 | `C`       | Open Configuration screen                                |
 | `H`       | Open History screen                                      |
-| `E`       | Export current session to CSV                            |
+| `X`       | Export current session to CSV                            |
 | `Q`       | Quit                                                     |
 
 Configuration screen:
@@ -126,6 +127,16 @@ Fields:
 | Laps target    | Number 1–99, or `D` to disable (race runs until Stop)     |
 | Min RSSI (dBm) | Integer like `-70` (more negative = needs closer pass)    |
 | Lockout (s)    | Number of seconds — race-start gate + per-car cooldown    |
+
+Debug screen shows:
+
+- Live view of the last 20 BLE advertisements received for the **selected car**,
+  newest first. Each row shows `rssi_dbm` and `age_ms` (time since the
+  advertisement was received). Refreshes every ~200 ms.
+- Samples are recorded for every advertisement matching a known car name —
+  including disabled cars — so the screen can be used to verify a transponder
+  is talking before it is enabled for racing.
+- `Esc` closes the screen.
 
 History screen shows:
 

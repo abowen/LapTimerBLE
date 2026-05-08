@@ -9,10 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Deque, Optional
 
 from .config import NUM_CARS, ble_local_name
+
+# Number of most-recent (rssi, monotonic_t) samples kept per car for the Debug
+# screen. Sized to comfortably exceed one screen of rows.
+DEBUG_BUFFER_SIZE = 20
 
 log = logging.getLogger(__name__)
 
@@ -86,9 +91,12 @@ class CarDetectorRegistry:
     drop_window_seconds: float = 0.3
 
     detectors: list[PeakDetector] = field(default_factory=list)
-    # Latest (rssi_dbm, monotonic_t) per car — overwritten on every feed,
+    # Latest (rssi_dbm, monotonic_t) per car — overwritten on every sample,
     # used by the UI to display live signal strength.
     latest_samples: list[Optional[tuple[int, float]]] = field(default_factory=list)
+    # Ring buffer of the last DEBUG_BUFFER_SIZE samples per car for the Debug
+    # screen. Populated by record_sample regardless of enabled state.
+    recent_samples: list[Deque[tuple[int, float]]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.detectors:
@@ -102,6 +110,8 @@ class CarDetectorRegistry:
             ]
         if not self.latest_samples:
             self.latest_samples = [None] * NUM_CARS
+        if not self.recent_samples:
+            self.recent_samples = [deque(maxlen=DEBUG_BUFFER_SIZE) for _ in range(NUM_CARS)]
 
     def reconfigure(
         self,
@@ -122,9 +132,21 @@ class CarDetectorRegistry:
         for d in self.detectors:
             d.reset()
         self.latest_samples = [None] * NUM_CARS
+        for buf in self.recent_samples:
+            buf.clear()
+
+    def record_sample(self, car_index: int, rssi: int, t: float) -> None:
+        """Record a sample without running the peak detector.
+
+        Called for every advertisement matching a known car name, even when the
+        car is disabled — this keeps the Debug screen useful as a "is the
+        transponder talking?" check before enabling.
+        """
+        self.latest_samples[car_index] = (rssi, t)
+        self.recent_samples[car_index].append((rssi, t))
 
     def feed(self, car_index: int, rssi: int, t: float) -> Optional[float]:
-        self.latest_samples[car_index] = (rssi, t)
+        self.record_sample(car_index, rssi, t)
         return self.detectors[car_index].feed(rssi, t)
 
 
@@ -161,12 +183,17 @@ class BleScanner:
             if not name:
                 return
             idx = self._name_to_index.get(name)
-            if idx is None or idx not in self._enabled_cars:
+            if idx is None:
                 return
             rssi = advertisement_data.rssi
             if rssi is None:
                 return
             t = loop.time()
+            if idx not in self._enabled_cars:
+                # Still record samples so the Debug screen / RSSI display work
+                # even before the car has been enabled for racing.
+                self.registry.record_sample(idx, int(rssi), t)
+                return
             peak_t = self.registry.feed(idx, int(rssi), t)
             if peak_t is not None:
                 self.on_pass(idx, peak_t)

@@ -25,7 +25,7 @@ from .config import (
 )
 from .export import export_all_time, export_race
 from .models import Lap, RaceState
-from .scanner import BleScanner, CarDetectorRegistry
+from .scanner import BleScanner, CarDetectorRegistry, DEBUG_BUFFER_SIZE
 from .storage import Storage
 from .timeutil import format_lap, format_race
 
@@ -361,6 +361,54 @@ class ConfigScreen(ModalScreen[Optional[RaceConfig]]):
         self.notify(message, severity="warning")
 
 
+class DebugScreen(ModalScreen[None]):
+    """Live view of the last DEBUG_BUFFER_SIZE BLE advertisements for one car."""
+
+    BINDINGS = [Binding("escape", "cancel", "Close")]
+
+    def __init__(self, registry: CarDetectorRegistry, car: CarConfig) -> None:
+        super().__init__()
+        self.registry = registry
+        self.car = car
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="modal"):
+            yield Static(
+                f"Debug — {self.car.number}. {self.car.display_name}",
+                classes="modal-title",
+            )
+            yield Static(
+                f"[grey]Last {DEBUG_BUFFER_SIZE} advertisements (newest first). "
+                f"rssi dBm   age ms[/grey]",
+                classes="hint",
+            )
+            yield Static(self._body_text(), id="debug-body")
+            yield Static("Esc to close.", classes="hint")
+
+    def on_mount(self) -> None:
+        self.set_interval(0.2, self._tick_refresh)
+
+    def _tick_refresh(self) -> None:
+        self.query_one("#debug-body", Static).update(self._body_text())
+
+    def _body_text(self) -> str:
+        samples = list(self.registry.recent_samples[self.car.index])
+        if not samples:
+            return "  [grey]no samples yet[/grey]"
+        try:
+            now = asyncio.get_running_loop().time()
+        except RuntimeError:
+            now = time.monotonic()
+        lines = []
+        for rssi, t in reversed(samples):
+            age_ms = max(0, int((now - t) * 1000))
+            lines.append(f"  {rssi:>4}   {age_ms:>5}")
+        return "\n".join(lines)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class HistoryScreen(ModalScreen[Optional[str]]):
     BINDINGS = [
         Binding("escape", "cancel", "Close"),
@@ -455,11 +503,12 @@ class LapTimerApp(App):
         Binding("8", "select(7)", "8"),
         Binding("left", "select_prev", "◀"),
         Binding("right", "select_next", "▶"),
-        Binding("d", "toggle_enabled", "Disable car"),
+        Binding("e", "toggle_enabled", "Enable/Disable"),
+        Binding("d", "open_debug", "Debug"),
         Binding("r", "rename", "Rename"),
         Binding("c", "open_config", "Config"),
         Binding("h", "open_history", "History"),
-        Binding("e", "export", "Export CSV"),
+        Binding("x", "export", "Export CSV"),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -698,6 +747,10 @@ class LapTimerApp(App):
             self._refresh_header()
 
         self.push_screen(ConfigScreen(self.config), _on_apply)
+
+    def action_open_debug(self) -> None:
+        car = self.cars[self.selected_car]
+        self.push_screen(DebugScreen(self.registry, car))
 
     def action_open_history(self) -> None:
         def _on_close(_value: str | None) -> None:

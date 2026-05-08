@@ -1,4 +1,4 @@
-from laptimerble.scanner import CarDetectorRegistry, PeakDetector
+from laptimerble.scanner import DEBUG_BUFFER_SIZE, CarDetectorRegistry, PeakDetector
 
 
 def test_below_threshold_never_fires() -> None:
@@ -94,6 +94,38 @@ def test_registry_records_latest_sample_per_car() -> None:
     reg.reset_all()
     assert reg.latest_samples[0] is None
     assert reg.latest_samples[1] is None
+
+
+def test_registry_record_sample_does_not_run_detector() -> None:
+    reg = CarDetectorRegistry(rssi_threshold=-70, lockout_seconds=0.0, drop_window_seconds=0.1)
+    # Strong sample that would emit a peak via feed(); via record_sample it must not.
+    reg.record_sample(0, -50, 0.10)
+    reg.record_sample(0, -60, 0.20)
+    reg.record_sample(0, -90, 0.50)
+    assert reg.latest_samples[0] == (-90, 0.50)
+    assert list(reg.recent_samples[0]) == [(-50, 0.10), (-60, 0.20), (-90, 0.50)]
+    # Detector must remain idle: a real pass after this still emits normally.
+    emitted = None
+    for rssi, t in [(-60, 1.0), (-50, 1.05), (-60, 1.10), (-90, 1.30)]:
+        result = reg.feed(0, rssi, t)
+        if result is not None:
+            emitted = result
+    assert emitted == 1.05
+
+
+def test_registry_recent_samples_bounded_and_cleared() -> None:
+    reg = CarDetectorRegistry(rssi_threshold=-70, lockout_seconds=0.0, drop_window_seconds=0.1)
+    n = DEBUG_BUFFER_SIZE + 5
+    for i in range(n):
+        reg.record_sample(0, -50 - i, float(i) * 0.01)
+    assert len(reg.recent_samples[0]) == DEBUG_BUFFER_SIZE
+    # Oldest entries should have been dropped: first kept sample is the (n - BUFFER)th.
+    first_kept = reg.recent_samples[0][0]
+    expected_first_idx = n - DEBUG_BUFFER_SIZE
+    assert first_kept == (-50 - expected_first_idx, expected_first_idx * 0.01)
+
+    reg.reset_all()
+    assert len(reg.recent_samples[0]) == 0
 
 
 def test_registry_per_car_independent() -> None:

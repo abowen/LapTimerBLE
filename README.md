@@ -6,31 +6,40 @@ records lap times when the RSSI peaks.
 
 See `plan.md` for the full design.
 
-## Run
+## Layout
 
-On NixOS:
-
-```sh
-nix-shell           # creates .venv and installs deps on first entry
-laptimerble
+```
+.
+├── scanner/    Python BLE scanner + Textual UI (runs on the laptop)
+├── firmware/   ESP32-C3 transponder firmware (PlatformIO + Arduino + NimBLE)
+└── plan.md     Spec shared by both halves
 ```
 
-Elsewhere (Python 3.12+):
+## Dev shell (NixOS)
 
 ```sh
-python -m venv .venv && source .venv/bin/activate
-pip install -e .
-laptimerble
+nix-shell      # creates .venv, installs the scanner, puts pio on PATH
 ```
 
-## Test
+## Run the scanner
 
 ```sh
-pip install -e '.[dev]'
-pytest
+laptimerble                       # inside nix-shell
+# or, elsewhere (Python 3.12+):
+cd scanner && pip install -e '.[dev]' && laptimerble
 ```
 
-## Firmware contract
+## Build & flash a transponder
 
-Each ESP32-C3 must advertise with local name `LapTimer-N` (N = 1..8) and the
-advertising interval listed in `plan.md`.
+Inside `nix-shell`:
+
+```sh
+cd firmware
+pio run -e car1 -t upload         # repeat for car2..car8
+```
+
+## Test the scanner
+
+```sh
+cd scanner && pytest
+```

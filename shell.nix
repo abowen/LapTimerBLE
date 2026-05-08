@@ -3,8 +3,9 @@
 pkgs.mkShell {
   packages = with pkgs; [
     python312
-    bluez       # runtime for bleak's BlueZ backend
-    dbus        # required by bleak on Linux
+    bluez         # runtime for bleak's BlueZ backend
+    dbus          # required by bleak on Linux
+    platformio    # firmware build / flash
   ];
 
   shellHook = ''
@@ -12,10 +13,12 @@ pkgs.mkShell {
       echo "Creating .venv ..."
       python -m venv .venv
       .venv/bin/pip install --quiet --upgrade pip
-      .venv/bin/pip install --quiet -e '.[dev]'
+      .venv/bin/pip install --quiet -e './scanner[dev]'
     fi
     # Activate without leaking PS1 changes if user already customised theirs.
     source .venv/bin/activate
-    echo "LapTimerBLE dev shell ready. Run: laptimerble  (or: pytest)"
+    echo "LapTimerBLE dev shell ready."
+    echo "  Scanner:  laptimerble        (tests: cd scanner && pytest)"
+    echo "  Firmware: cd firmware && pio run -e car1 -t upload"
   '';
 }

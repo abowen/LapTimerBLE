@@ -7,9 +7,11 @@ side-mounted laptop scanner.
 
 ## Scope
 
-This implementation covers the **scanner / UI** side only (Python on the laptop).
-ESP32-C3 firmware is out of scope but its BLE behaviour is specified below so the
-two halves can be developed independently.
+The repository contains both halves of the system, developed independently
+against the BLE protocol below as the contract:
+
+- `scanner/` — Python scanner + Textual UI on the laptop.
+- `firmware/` — ESP32-C3 transponder firmware (PlatformIO + Arduino + NimBLE).
 
 ## Hardware
 
@@ -29,7 +31,12 @@ two halves can be developed independently.
 
 ## BLE protocol (firmware contract)
 
-- Each car advertises a BLE local name `LapTimer-N` where `N` is 1..8
+- Each car advertises a BLE local name `LapTimer-N` where `N` is 1..8.
+- Advertising is non-connectable, undirected, with both min and max interval
+  pinned to the per-car value below (no jitter).
+- TX power is set to +9 dBm so all transponders are equivalent at the reader.
+- The car number is selected at firmware build time (`CAR_NUMBER` build flag);
+  one PlatformIO environment per car (`car1` … `car8`).
 - Advertising intervals (one per car, primes near 20 ms baseline to minimise
   collisions):
 

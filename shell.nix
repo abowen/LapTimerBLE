@@ -18,7 +18,7 @@ pkgs.mkShell {
     # Activate without leaking PS1 changes if user already customised theirs.
     source .venv/bin/activate
     echo "LapTimerBLE dev shell ready."
-    echo "  Scanner:  laptimerble        (tests: cd scanner && pytest)"
+    echo "  Scanner:  cd scanner && pip install -e '.[dev]' && laptimerble (tests: cd scanner && pytest)"
     echo "  Firmware: cd firmware && pio run -e car1 -t upload"
   '';
 }

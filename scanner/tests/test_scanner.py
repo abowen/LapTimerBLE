@@ -78,6 +78,24 @@ def test_registry_reconfigure_propagates() -> None:
         assert det.lockout_seconds == 1.5
 
 
+def test_registry_records_latest_sample_per_car() -> None:
+    reg = CarDetectorRegistry(rssi_threshold=-70, lockout_seconds=0.0, drop_window_seconds=0.1)
+    assert reg.latest_samples[0] is None
+    assert reg.latest_samples[1] is None
+
+    reg.feed(0, -60, 0.10)
+    reg.feed(0, -55, 0.20)  # latest for car 0
+    reg.feed(1, -80, 0.15)  # below threshold but still recorded as last sample
+
+    assert reg.latest_samples[0] == (-55, 0.20)
+    assert reg.latest_samples[1] == (-80, 0.15)
+    assert reg.latest_samples[2] is None
+
+    reg.reset_all()
+    assert reg.latest_samples[0] is None
+    assert reg.latest_samples[1] is None
+
+
 def test_registry_per_car_independent() -> None:
     reg = CarDetectorRegistry(rssi_threshold=-70, lockout_seconds=0.0, drop_window_seconds=0.1)
     # Car 0 emits, Car 1 should still be able to emit independently in same time window.

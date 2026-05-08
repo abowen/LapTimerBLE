@@ -86,6 +86,9 @@ class CarDetectorRegistry:
     drop_window_seconds: float = 0.3
 
     detectors: list[PeakDetector] = field(default_factory=list)
+    # Latest (rssi_dbm, monotonic_t) per car — overwritten on every feed,
+    # used by the UI to display live signal strength.
+    latest_samples: list[Optional[tuple[int, float]]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.detectors:
@@ -97,6 +100,8 @@ class CarDetectorRegistry:
                 )
                 for _ in range(NUM_CARS)
             ]
+        if not self.latest_samples:
+            self.latest_samples = [None] * NUM_CARS
 
     def reconfigure(
         self,
@@ -116,8 +121,10 @@ class CarDetectorRegistry:
     def reset_all(self) -> None:
         for d in self.detectors:
             d.reset()
+        self.latest_samples = [None] * NUM_CARS
 
     def feed(self, car_index: int, rssi: int, t: float) -> Optional[float]:
+        self.latest_samples[car_index] = (rssi, t)
         return self.detectors[car_index].feed(rssi, t)
 
 

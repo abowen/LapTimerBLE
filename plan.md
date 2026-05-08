@@ -27,7 +27,6 @@ against the BLE protocol below as the contract:
 | Reader location      | Side-mounted, up to 3 m lateral    |
 | Cars supported       | 8, each uniquely identified        |
 | Timing precision     | within 0.1 s                       |
-| Environment          | Outdoor, dry                       |
 
 ## BLE protocol (firmware contract)
 
@@ -85,6 +84,8 @@ Per-car threshold-plus-lockout peak detector:
 - Active cars rendered white, disabled cars grey.
 - Each car card shows:
   - Car number + display name
+  - Latest detected RSSI (raw dBm integer) below the name; `—` when no recent
+    sample (older than 2 s, scanner off, or car disabled)
   - Current race laps (one per row), with elapsed time per lap
 - Default car display names: `One`, `Two`, …, `Eight`.
 - Selected car visually highlighted.

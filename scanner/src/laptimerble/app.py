@@ -163,6 +163,7 @@ class CarCard(Static):
         self.car = car
         self.laps: list[Lap] = []
         self.finished: bool = False
+        self.latest_rssi: Optional[int] = None
         self.add_class("car-card")
         if not car.enabled:
             self.add_class("disabled")
@@ -173,10 +174,12 @@ class CarCard(Static):
         laps: list[Lap],
         finished: bool,
         selected: bool,
+        latest_rssi: Optional[int] = None,
     ) -> None:
         self.car = car
         self.laps = laps
         self.finished = finished
+        self.latest_rssi = latest_rssi
 
         self.set_class(not car.enabled, "disabled")
         self.set_class(selected, "selected")
@@ -191,6 +194,12 @@ class CarCard(Static):
         elif self.finished:
             header += " ✓"
 
+        if car.enabled:
+            rssi_text = "—" if self.latest_rssi is None else str(self.latest_rssi)
+            rssi_line = f"[grey]{rssi_text}[/grey]\n"
+        else:
+            rssi_line = ""
+
         if not car.enabled:
             laps_section = "[grey]disabled[/grey]"
         elif not self.laps:
@@ -201,7 +210,7 @@ class CarCard(Static):
                 lines.append(f"L{lap.lap_index:>2}  {format_lap(lap.lap_seconds)}")
             laps_section = "\n".join(lines)
 
-        self.update(f"{header}\n{laps_section}")
+        self.update(f"{header}\n{rssi_line}{laps_section}")
 
 
 # ----- modal screens -----------------------------------------------------------
@@ -496,6 +505,7 @@ class LapTimerApp(App):
 
     async def on_mount(self) -> None:
         self.set_interval(0.05, self._tick)
+        self.set_interval(0.2, self._refresh_cards)
         self._refresh_header()
         self._refresh_cards()
         # Start the BLE scanner. Failure is non-fatal; the UI still works.
@@ -618,7 +628,22 @@ class LapTimerApp(App):
             laps=laps,
             finished=finished,
             selected=(car_index == self.selected_car),
+            latest_rssi=self._latest_rssi(car_index),
         )
+
+    def _latest_rssi(self, car_index: int) -> Optional[int]:
+        sample = self.registry.latest_samples[car_index]
+        if sample is None:
+            return None
+        rssi, sample_t = sample
+        # Match the clock the scanner uses when feeding the registry.
+        try:
+            now = asyncio.get_running_loop().time()
+        except RuntimeError:
+            now = time.monotonic()
+        if now - sample_t > 2.0:
+            return None
+        return rssi
 
     # ----- actions -----
 

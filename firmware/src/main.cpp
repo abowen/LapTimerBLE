@@ -32,6 +32,12 @@ constexpr uint8_t kLedPin = 8;
 
 void setup() {
   Serial.begin(115200);
+  // ESP32-C3 USB-Serial/JTAG: wait briefly for the host to attach so the
+  // boot banner isn't lost when the monitor connects after reset.
+  const uint32_t serial_wait_start = millis();
+  while (!Serial && (millis() - serial_wait_start) < 2000) {
+    delay(10);
+  }
 
   pinMode(kLedPin, OUTPUT);
   digitalWrite(kLedPin, HIGH);  // off (active-low)

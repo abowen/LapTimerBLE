@@ -198,9 +198,61 @@ class BleScanner:
             if peak_t is not None:
                 self.on_pass(idx, peak_t)
 
-        self._scanner = BleakScanner(detection_callback=_detection_callback)
-        await self._scanner.start()
-        log.info("BLE scanner started")
+        # BlueZ's classic *active* discovery path coalesces advertisements
+        # through D-Bus PropertiesChanged signals and a discovery cache, so
+        # even with DuplicateData=True the detection callback fires only every
+        # few seconds. Passive scanning with kernel-level AdvertisementMonitor
+        # patterns (BlueZ 5.56+, kernel >= 5.10) delivers every matching ad
+        # straight from the controller — perfect for the 20 ms transponder.
+        #
+        # Fallback: if the adapter / kernel doesn't support monitors, drop to
+        # active mode with DuplicateData=True (better than nothing).
+        self._scanner = await self._start_passive(_detection_callback)
+        if self._scanner is None:
+            self._scanner = await self._start_active(_detection_callback)
+
+    async def _start_passive(self, detection_callback) -> object | None:  # type: ignore[no-untyped-def]
+        from bleak import BleakScanner  # noqa: WPS433
+
+        try:
+            from bleak.args.bluez import OrPattern  # noqa: WPS433
+            from bleak.assigned_numbers import AdvertisementDataType  # noqa: WPS433
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bleak BlueZ args unavailable (%s); using active scan", exc)
+            return None
+
+        # Match any local name starting with "LapTimer-" — covers all 8 cars.
+        or_patterns = [
+            OrPattern(0, AdvertisementDataType.COMPLETE_LOCAL_NAME, b"LapTimer-"),
+            OrPattern(0, AdvertisementDataType.SHORTENED_LOCAL_NAME, b"LapTimer-"),
+        ]
+        scanner = BleakScanner(
+            detection_callback=detection_callback,
+            scanning_mode="passive",
+            bluez={"or_patterns": or_patterns},
+        )
+        try:
+            await scanner.start()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Passive scan unsupported (%s); falling back to active", exc)
+            try:
+                await scanner.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+        log.info("BLE scanner started (passive + advertisement monitor)")
+        return scanner
+
+    async def _start_active(self, detection_callback) -> object:  # type: ignore[no-untyped-def]
+        from bleak import BleakScanner  # noqa: WPS433
+
+        scanner = BleakScanner(
+            detection_callback=detection_callback,
+            bluez={"filters": {"DuplicateData": True}},
+        )
+        await scanner.start()
+        log.info("BLE scanner started (active + DuplicateData=True)")
+        return scanner
 
     async def stop(self) -> None:
         if self._scanner is not None:

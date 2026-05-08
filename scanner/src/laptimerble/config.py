@@ -26,7 +26,7 @@ def ble_local_name(car_index: int) -> str:
 @dataclass
 class RaceConfig:
     laps_target: int | None = 3  # None = unlimited (LD)
-    rssi_threshold_dbm: int = -70
+    rssi_threshold_dbm: int = -100
     lockout_seconds: float = 3.0
     drop_window_seconds: float = 0.3
 

@@ -18,6 +18,76 @@ against the BLE protocol below as the contract:
 - Car (transponder): Seeed XIAO ESP32-C3, powered from the ESC's BEC
 - Scanner: Framework 13 (Ryzen 7840U) with Bluetooth 5.2, running NixOS
 
+## Scanner host requirements
+
+The 20–47 ms advertising cadence is only deliverable end-to-end when BlueZ
+exposes `org.bluez.AdvertisementMonitorManager1`. Bleak's passive scan
+registers an OR-pattern monitor on that interface and receives one callback
+per matching advertisement. Without it, the scanner falls back to active
+discovery; BlueZ then routes ads through its D-Bus discovery cache and
+`PropertiesChanged` is coalesced to multi-second updates, defeating peak
+detection.
+
+`AdvertisementMonitorManager1` is registered only when bluetoothd runs with
+**Experimental features enabled**. On NixOS:
+
+```nix
+hardware.bluetooth.settings.General.Experimental = true;
+```
+
+After `nixos-rebuild switch` and `systemctl restart bluetooth`, verify:
+
+```sh
+busctl call org.bluez /org/bluez/hci0 \
+  org.bluez.AdvertisementMonitorManager1 SupportedMonitorTypes
+```
+
+should return a non-empty array (e.g. `as 1 "or_patterns"`). The header in
+the running app shows `BLE: scanning (passive)` in green when this works,
+and `BLE: scanning (active) — passive unavailable` in red when it doesn't.
+
+**Controller offload requirement.** Even with `Experimental = true`, the
+passive path only delivers events if the BT controller offloads pattern
+matching to hardware. Check:
+
+```sh
+busctl get-property org.bluez /org/bluez/hci0 \
+  org.bluez.AdvertisementMonitorManager1 SupportedFeatures
+```
+
+A non-empty list (e.g. `controller-patterns`) means offload works — passive
+will deliver every matching ad. An empty list (`as 0`) means BlueZ accepts
+the monitor registration but never runs a scan to source matches from, so
+0 callbacks are delivered. The MediaTek MT7921 in the Framework 13 AMD
+returns empty here; the scanner detects this case at startup and forces the
+active+`DuplicateData=True` path.
+
+**Active-mode throughput on MT7921.** With Wi-Fi enabled and the transponder
+~3 m away, the AMD/MT7921 combo card produces about 5–8 callbacks/sec for
+a 50 Hz advertiser — far below the firmware's ad rate but still enough to
+catch every pass for the side-mounted 30 kph scenario. The rate is gated by
+two things:
+
+1. **BT/Wi-Fi antenna sharing.** The MT7921 multiplexes one antenna between
+   BT and Wi-Fi — heavy Wi-Fi traffic halves (or worse) BT scan duty. If
+   throughput collapses to "every few seconds", check whether Wi-Fi is busy.
+   Quickest test: `nmcli radio wifi off`, then watch the rate climb in the
+   header.
+2. **Kernel LE scan parameters.** `/sys/kernel/debug/bluetooth/hci0/le_scan_int`
+   and `le_scan_window` (units of 0.625 ms) control the scan duty cycle.
+   Default is around 60/30 ms (50 % duty); setting both to `16` (10 ms / 10 ms,
+   100 % duty on its time slot) is the upper bound for this controller. It
+   needs root and survives until reboot:
+   ```sh
+   echo 16 | sudo tee /sys/kernel/debug/bluetooth/hci0/le_scan_int
+   echo 16 | sudo tee /sys/kernel/debug/bluetooth/hci0/le_scan_window
+   ```
+   Make permanent via a NixOS systemd one-shot service if it helps.
+
+The header shows the live rolling rate (e.g. `BLE: scanning (active) — passive
+unavailable 7.3 Hz`) so the operator can confirm the controller is keeping
+up before each session.
+
 ## Race requirements
 
 | Parameter            | Value                              |
@@ -179,7 +249,7 @@ History screen shows:
 | Enabled cars          | Car 1 only             |
 | Laps target           | 3                      |
 | Lockout (s)           | 3                      |
-| RSSI threshold (dBm)  | -70                    |
+| RSSI threshold (dBm)  | -100                   |
 | Drop-window (s)       | 0.3 (internal)         |
 
 ## Tests

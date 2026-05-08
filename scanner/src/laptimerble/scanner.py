@@ -25,6 +25,46 @@ log = logging.getLogger(__name__)
 PassCallback = Callable[[int, float], None]  # (car_index, peak_t)
 
 
+def _advertisement_monitor_offload_supported(adapter: str = "hci0") -> bool:
+    """Does ``org.bluez.AdvertisementMonitorManager1.SupportedFeatures`` list anything?
+
+    Empty list → the BT controller cannot offload OR-pattern matching to
+    hardware. Without offload, BlueZ accepts an OrPattern monitor but never
+    runs a scan to source matches from, so the monitor produces 0 callbacks.
+    Use ``busctl`` rather than dragging in dbus-fast/dbus-next at module load
+    — this is a one-shot startup probe.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [
+                "busctl",
+                "--system",
+                "get-property",
+                "org.bluez",
+                f"/org/bluez/{adapter}",
+                "org.bluez.AdvertisementMonitorManager1",
+                "SupportedFeatures",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    if result.returncode != 0:
+        return False
+    # Output looks like  as 2 "controller-patterns" "..."  or  as 0
+    parts = result.stdout.strip().split(maxsplit=2)
+    if len(parts) < 2 or parts[0] != "as":
+        return False
+    try:
+        return int(parts[1]) > 0
+    except ValueError:
+        return False
+
+
 @dataclass
 class PeakDetector:
     """Threshold + lockout peak detector for one car.
@@ -39,7 +79,7 @@ class PeakDetector:
     ``lockout_seconds``.
     """
 
-    rssi_threshold: int = -70
+    rssi_threshold: int = -100
     lockout_seconds: float = 3.0
     drop_window_seconds: float = 0.3
 
@@ -86,7 +126,7 @@ class PeakDetector:
 class CarDetectorRegistry:
     """One ``PeakDetector`` per car index, configured uniformly."""
 
-    rssi_threshold: int = -70
+    rssi_threshold: int = -100
     lockout_seconds: float = 3.0
     drop_window_seconds: float = 0.3
 
@@ -169,9 +209,44 @@ class BleScanner:
         self._name_to_index: dict[str, int] = {
             ble_local_name(i): i for i in range(NUM_CARS)
         }
+        # Set after start() to "passive" or "active" so the UI can surface
+        # which path actually came up — silent fallback to active masks the
+        # main perf regression (BlueZ D-Bus discovery cache coalescing ads
+        # to multi-second updates), so make it visible.
+        self.mode: Optional[str] = None
+        # Reason passive scan was rejected, if it was. Useful for the UI.
+        self.passive_failure_reason: Optional[str] = None
+        # Rolling per-second callback rate across all LapTimer-* cars so the
+        # header can show actual throughput. The MT7921's BT/Wi-Fi shared
+        # antenna throttles BT during Wi-Fi activity, so this number is what
+        # actually matters for whether peak detection has the resolution to
+        # find a 30 kph pass — not the firmware's 50 Hz advertising rate.
+        self._callback_times: Deque[float] = deque(maxlen=512)
 
     def set_enabled(self, indices: set[int]) -> None:
         self._enabled_cars = set(indices)
+
+    def callback_rate_hz(self, window_seconds: float = 5.0) -> Optional[float]:
+        """Callbacks per second over the trailing ``window_seconds``.
+
+        Returns ``None`` until at least two samples land inside the window —
+        a single callback gives no rate, and showing 0 Hz right after start
+        looks like a failure rather than "no data yet".
+        """
+        try:
+            now = asyncio.get_running_loop().time()
+        except RuntimeError:
+            return None
+        cutoff = now - window_seconds
+        # deque slicing is O(n); n is bounded by maxlen and we're called at
+        # the header-refresh cadence, so this is fine.
+        in_window = [t for t in self._callback_times if t >= cutoff]
+        if len(in_window) < 2:
+            return None
+        span = in_window[-1] - in_window[0]
+        if span <= 0:
+            return None
+        return (len(in_window) - 1) / span
 
     async def start(self) -> None:
         from bleak import BleakScanner  # noqa: WPS433
@@ -189,6 +264,7 @@ class BleScanner:
             if rssi is None:
                 return
             t = loop.time()
+            self._callback_times.append(t)
             if idx not in self._enabled_cars:
                 # Still record samples so the Debug screen / RSSI display work
                 # even before the car has been enabled for racing.
@@ -210,6 +286,9 @@ class BleScanner:
         self._scanner = await self._start_passive(_detection_callback)
         if self._scanner is None:
             self._scanner = await self._start_active(_detection_callback)
+            self.mode = "active"
+        else:
+            self.mode = "passive"
 
     async def _start_passive(self, detection_callback) -> object | None:  # type: ignore[no-untyped-def]
         from bleak import BleakScanner  # noqa: WPS433
@@ -219,6 +298,23 @@ class BleScanner:
             from bleak.assigned_numbers import AdvertisementDataType  # noqa: WPS433
         except Exception as exc:  # noqa: BLE001
             log.warning("bleak BlueZ args unavailable (%s); using active scan", exc)
+            self.passive_failure_reason = f"bleak args unavailable: {exc}"
+            return None
+
+        # BlueZ will happily register an OrPattern monitor even when the
+        # controller has no MSFT offload — but in that case no LE scan is
+        # auto-started and the monitor never fires (observed on MediaTek
+        # MT7921: SupportedFeatures = []). Guard against this silent failure
+        # so we fall back to active+DuplicateData rather than reporting
+        # passive-mode while delivering 0 callbacks.
+        if not _advertisement_monitor_offload_supported():
+            self.passive_failure_reason = (
+                "controller does not offload AdvertisementMonitor patterns"
+            )
+            log.warning(
+                "Passive scan skipped: %s",
+                self.passive_failure_reason,
+            )
             return None
 
         # Match any local name starting with "LapTimer-" — covers all 8 cars.
@@ -235,6 +331,7 @@ class BleScanner:
             await scanner.start()
         except Exception as exc:  # noqa: BLE001
             log.warning("Passive scan unsupported (%s); falling back to active", exc)
+            self.passive_failure_reason = str(exc) or type(exc).__name__
             try:
                 await scanner.stop()
             except Exception:  # noqa: BLE001
@@ -261,3 +358,4 @@ class BleScanner:
             except Exception:  # noqa: BLE001
                 log.exception("Error stopping BLE scanner")
             self._scanner = None
+        self.mode = None

@@ -147,6 +147,16 @@ Screen {
     margin: 1 0 0 0;
     text-style: bold;
 }
+
+#debug-scroll {
+    /* 1fr so the scroll region absorbs whatever vertical space the modal has
+       left; without this, the body Static is clipped by the auto-sized Vertical
+       in a way that leaves the OLDEST samples on screen — those have a fixed
+       rssi but a constantly-growing age, which looked like "rssi never updates". */
+    height: 1fr;
+    border: none;
+    background: $surface;
+}
 """
 
 
@@ -382,7 +392,8 @@ class DebugScreen(ModalScreen[None]):
                 f"rssi dBm   age ms[/grey]",
                 classes="hint",
             )
-            yield Static(self._body_text(), id="debug-body")
+            with VerticalScroll(id="debug-scroll"):
+                yield Static(self._body_text(), id="debug-body")
             yield Static("Esc to close.", classes="hint")
 
     def on_mount(self) -> None:
@@ -562,7 +573,12 @@ class LapTimerApp(App):
             self.scanner = BleScanner(self.registry, on_pass=self._on_ble_pass)
             self.scanner.set_enabled({c.index for c in self.cars if c.enabled})
             await self.scanner.start()
-            self.scanner_status = "scanning"
+            # Surface the scan path: "passive" goes through BlueZ's
+            # AdvertisementMonitor (one callback per advertisement) and is
+            # required for the 20–47 ms transponder cadence; "active" falls
+            # through D-Bus PropertiesChanged coalescing and updates only
+            # every few seconds — visible here so silent fallback is obvious.
+            self.scanner_status = f"scanning ({self.scanner.mode or 'unknown'})"
         except Exception as exc:  # noqa: BLE001
             log.exception("BLE scanner failed to start")
             self.scanner_status = f"off ({type(exc).__name__})"
@@ -641,11 +657,29 @@ class LapTimerApp(App):
             elapsed = format_race(self._race_elapsed())
 
         target = "∞" if self.config.laps_target is None else str(self.config.laps_target)
+        ble_status = self._ble_status_markup()
         config_line = (
             f"[grey]Laps {target}  RSSI ≥ {self.config.rssi_threshold_dbm} dBm  "
-            f"Lockout {self.config.lockout_seconds:g}s  BLE: {self.scanner_status}[/grey]"
+            f"Lockout {self.config.lockout_seconds:g}s  BLE:[/grey] {ble_status}"
         )
         header.update(f"{line1}\n[bold]{elapsed}[/bold]\n{config_line}")
+
+    def _ble_status_markup(self) -> str:
+        # passive = AdvertisementMonitor path (one callback per ad → ideal)
+        # active  = D-Bus discovery + DuplicateData=True (the only working
+        #           path on the MT7921 — not an error, just a fact)
+        # off     = scanner failed to start (the only real error)
+        scanner = self.scanner
+        if scanner is None:
+            return f"[red]{self.scanner_status}[/red]"
+        rate = scanner.callback_rate_hz()
+        rate_text = f" {rate:.1f} Hz" if rate is not None else ""
+        if scanner.mode == "passive":
+            return f"[green]{self.scanner_status}{rate_text}[/green]"
+        # mode == "active" or unknown: render in normal grey alongside the
+        # other config fields. Don't flag it as an error — the host config
+        # check ran at startup and concluded active is the correct path.
+        return f"[grey]{self.scanner_status}{rate_text}[/grey]"
 
     def _race_elapsed(self) -> float:
         if self.start_monotonic is None:

@@ -64,10 +64,32 @@ def test_lockout_releases_after_window() -> None:
 
 
 def test_drop_window_must_elapse_before_emission() -> None:
+    """No emission can happen until the running peak has been stale for at
+    least ``drop_window_seconds``."""
     det = PeakDetector(rssi_threshold=-70, lockout_seconds=0.0, drop_window_seconds=0.5)
-    # All samples above threshold — never closes window.
+    # 20 × 0.02 = 0.38 s of steady RSSI < drop_window. Peak does not advance
+    # past sample 0, but the window can't close yet.
     for i in range(20):
         assert det.feed(-60, i * 0.02) is None
+
+
+def test_stalled_peak_emits_even_without_dropping_below_threshold() -> None:
+    """Regression: with the threshold set well below the noise floor (e.g. the
+    -100 dBm default), real-world RSSI never falls back below it, so window
+    closure has to come from the running peak going stale, not from a sub-
+    threshold sample."""
+    det = PeakDetector(rssi_threshold=-100, lockout_seconds=0.0, drop_window_seconds=0.3)
+    # Rising approach.
+    assert det.feed(-80, 0.00) is None
+    assert det.feed(-70, 0.05) is None
+    assert det.feed(-60, 0.10) is None  # peak at 0.10
+    # Plateau / decline; all samples remain above the -100 threshold.
+    assert det.feed(-65, 0.15) is None
+    assert det.feed(-70, 0.25) is None
+    assert det.feed(-75, 0.35) is None
+    # 0.45 - 0.10 = 0.35 ≥ 0.3 → window closes, peak timestamp is emitted.
+    emitted = det.feed(-80, 0.45)
+    assert emitted == 0.10
 
 
 def test_registry_reconfigure_propagates() -> None:

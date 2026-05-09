@@ -16,6 +16,7 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Input, Label, Static
 
+from .audio import play_countdown_beep, play_go_beep, play_lap_beep
 from .config import (
     NUM_CARS,
     CarConfig,
@@ -632,6 +633,7 @@ class LapTimerApp(App):
                 lap_seconds=lap_seconds,
                 recorded_at=lap.recorded_at,
             )
+        play_lap_beep()
         self._refresh_card(car_index)
         self._maybe_finish_race()
 
@@ -812,6 +814,7 @@ class LapTimerApp(App):
         self.mode = "countdown"
         self.countdown_value = 3
         self._refresh_header()
+        play_countdown_beep()
         self.set_timer(1.0, self._countdown_step)
 
     def _countdown_step(self) -> None:
@@ -822,9 +825,11 @@ class LapTimerApp(App):
             # Show "GO" briefly then start
             self.countdown_value = 0
             self._refresh_header()
+            play_go_beep()
             self.set_timer(0.5, self._start_race)
         else:
             self._refresh_header()
+            play_countdown_beep()
             self.set_timer(1.0, self._countdown_step)
 
     def _reset_race_state(self) -> None:

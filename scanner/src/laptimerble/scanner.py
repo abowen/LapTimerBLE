@@ -76,11 +76,13 @@ class PeakDetector:
     Feed it ``(rssi_dbm, monotonic_t)`` samples in time order. It returns the
     timestamp at which a complete pass was detected, otherwise ``None``.
 
-    The detector is idle until RSSI rises above ``rssi_threshold``. Once in a
-    pass window it tracks the strongest sample seen. The window closes (and a
-    pass is emitted) when RSSI has been below the threshold for at least
-    ``drop_window_seconds``. After emission, it ignores everything for
-    ``lockout_seconds``.
+    The detector is idle until RSSI clears ``rssi_threshold`` (a noise gate).
+    Once in a pass window it tracks the strongest sample seen. The window
+    closes (and a pass is emitted) when the running peak has not advanced for
+    ``drop_window_seconds`` — i.e. RSSI is no longer rising. The detector does
+    *not* require RSSI to fall back below the threshold, which would be
+    unreliable when the threshold is set well below the noise floor. After
+    emission, it ignores everything for ``lockout_seconds``.
     """
 
     rssi_threshold: int = -100
@@ -90,14 +92,12 @@ class PeakDetector:
     in_window: bool = False
     window_peak_rssi: int = -200
     window_peak_t: float = 0.0
-    last_above_t: float = 0.0
     last_emit_t: float = -1e9  # so first call is always allowed
 
     def reset(self) -> None:
         self.in_window = False
         self.window_peak_rssi = -200
         self.window_peak_t = 0.0
-        self.last_above_t = 0.0
         self.last_emit_t = -1e9
 
     def feed(self, rssi: int, t: float) -> Optional[float]:
@@ -105,25 +105,36 @@ class PeakDetector:
         if (t - self.last_emit_t) < self.lockout_seconds:
             return None
 
-        if rssi >= self.rssi_threshold:
-            self.last_above_t = t
-            if not self.in_window:
-                self.in_window = True
-                self.window_peak_rssi = rssi
-                self.window_peak_t = t
-            elif rssi > self.window_peak_rssi:
-                self.window_peak_rssi = rssi
-                self.window_peak_t = t
+        if rssi < self.rssi_threshold:
+            # Below the noise gate. If a window is open and the peak has been
+            # stale long enough, this is a fine moment to close it.
+            if self.in_window and (t - self.window_peak_t) >= self.drop_window_seconds:
+                return self._emit()
             return None
 
-        # Below threshold: see if the open window has been quiet long enough
-        if self.in_window and (t - self.last_above_t) >= self.drop_window_seconds:
-            peak_t = self.window_peak_t
-            self.in_window = False
-            self.window_peak_rssi = -200
-            self.last_emit_t = peak_t
-            return peak_t
+        if not self.in_window:
+            self.in_window = True
+            self.window_peak_rssi = rssi
+            self.window_peak_t = t
+            return None
+
+        if rssi > self.window_peak_rssi:
+            self.window_peak_rssi = rssi
+            self.window_peak_t = t
+            return None
+
+        # Above threshold, but not a new peak. Close the window once the peak
+        # has been stale for the drop window.
+        if (t - self.window_peak_t) >= self.drop_window_seconds:
+            return self._emit()
         return None
+
+    def _emit(self) -> float:
+        peak_t = self.window_peak_t
+        self.in_window = False
+        self.window_peak_rssi = -200
+        self.last_emit_t = peak_t
+        return peak_t
 
 
 @dataclass

@@ -114,24 +114,45 @@ coex is or isn't the limiter.
 
 Per-car threshold-plus-lockout peak detector:
 
-1. Samples below the configured RSSI threshold are ignored.
-2. When a sample first crosses the threshold a "pass window" opens.
-3. While in the window, track the max RSSI sample and its timestamp.
-4. When samples have been below the threshold for a short drop period (~300 ms)
-   the window closes and the peak's timestamp is the lap-completion time.
+1. Samples below the configured RSSI threshold are ignored — it acts as a
+   noise gate.
+2. When a sample first clears the threshold a "pass window" opens.
+3. While in the window, track the strongest RSSI sample seen and its timestamp.
+4. When the running peak has not advanced for `drop_window_seconds` (~300 ms)
+   — i.e. RSSI is no longer rising — the window closes and the peak's
+   timestamp is the lap-completion time. The window does *not* require RSSI
+   to fall back below the threshold, because with the threshold defaulted to
+   -100 dBm (well under the noise floor) real-world RSSI never gets that low,
+   and "wait for sub-threshold" would leave the window open forever.
 5. After emitting a lap, the per-car detector is locked out for `lockout_seconds`
    (same value used as the race-start lockout — see below).
 
 ## Race flow
 
 1. **Idle** — Car 1 enabled by default.
-2. **Start pressed** — 3-second visible countdown (3, 2, 1, GO).
+2. **Start pressed** — 3-second visible countdown (3, 2, 1, GO). Each
+   countdown tick plays a 300 ms / 800 Hz beep; "GO" plays a higher
+   500 ms / 1600 Hz beep.
 3. **Running** — "GO" the race timer starts; lap detection is suppressed for
    the configured `lockout_seconds` (default 3 s) to prevent recording the start
    line as a lap.
-4. **Lap detected** — Append to the car's lap list, recompute its top-5-today.
+4. **Lap detected** — Append to the car's lap list, recompute its top-5-today,
+   and play a 100 ms / 1200 Hz beep so the operator hears each lap.
 5. **Finished** — when every enabled car has reached the configured lap count
    (or never, if lap counting is disabled). Also stoppable manually.
+
+### Audio cues
+
+Sine-wave tones are generated in pure Python by `laptimerble.audio` and piped
+as raw PCM to whichever system player is on PATH, in this order:
+
+1. `paplay` — PulseAudio / PipeWire-pulse (`pkgs.pulseaudio` client tools)
+2. `pw-cat` — PipeWire native (`pkgs.pipewire`, already present on this host)
+3. `aplay`  — ALSA fallback (`pkgs.alsa-utils`)
+
+If none are on PATH the calls silently no-op, so audio is purely a UX
+enhancement and does not block the app from running. PipeWire on the
+Framework 13 ships `pw-cat` by default, which is what the app will use.
 
 ## UI / UX (Textual)
 
